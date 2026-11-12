@@ -1,0 +1,255 @@
+TESTBENCH
+
+// =============================================================================
+// testbench.sv -- AuthentiRx : self-checking testbench for rep_decoder
+// -----------------------------------------------------------------------------
+// PART A - DIRECTED TESTS (pass/fail correctness proof)
+// The TB plays BOTH roles:
+// * the factory: picks a random key K and random raw bits R, then builds
+//      the public helper data W = R xor repeat(K)
+// * the chip: feeds noisy raw bits R' (R with some bits flipped) plus W
+// Test 1: at most REP/2 flips per group -> key must match exactly
+// Test 2: up to REP/2+1 flips per group -> an over-noisy group MUST decode
+//         to the wrong bit (proves majority voting is really happening)
+// Test 3: 'clear' mid-key, then a clean key -> must still be correct
+// Test 4: two keys back to back (counters wrap correctly)
+// Test 5: 'wipe' must zero the key register
+//
+// PART B - MONTE CARLO (the result worth presenting)
+// Flips every raw bit independently with probability pe and counts how often
+// the whole 64-bit key fails to be recovered. Compares the measured rate
+// against the binomial prediction
+//      P_bit = sum_{i>REP/2} C(REP,i) pe^i (1-pe)^(REP-i)
+//      P_key = 1 - (1 - P_bit)^KEY_BITS
+// Run it at REP = 5, then 9, then 15 (edit the localparam below) to show
+// that REP = 5 is undersized and REP = 15 fixes it.
+// =============================================================================
+`timescale 1ns/1ps
+
+module tb_rep_decoder;
+
+ // ---- EDIT THESE TWO FOR EACH RUN -----------------------------------------
+ localparam int REP = 5; // try 5, then 9, then 15 (must be odd)
+ localparam int TRIALS = 400; // Monte Carlo trials per error rate
+ // --------------------------------------------------------------------------
+
+ localparam int KEY_BITS = 64;
+ localparam int NUM_PAIRS = KEY_BITS * REP;
+ localparam bit RUN_MC = 1; // set to 0 to skip Part B if time is short
+
+ logic clk = 0, rst_n = 0, clear = 0, wipe = 0;
+ logic in_valid = 0, raw_bit = 0, helper_bit = 0;
+ wire [KEY_BITS-1:0] key;
+ wire            key_valid;
+
+ rep_decoder #(.REP(REP), .KEY_BITS(KEY_BITS)) dut (
+  .clk     (clk),
+  .rst_n    (rst_n),
+  .clear    (clear),
+  .wipe      (wipe),
+  .in_valid (in_valid),
+  .raw_bit (raw_bit),
+  .helper_bit (helper_bit),
+  .key      (key),
+  .key_valid (key_valid)
+ );
+
+ always #5 clk = ~clk;       // 100 MHz
+
+ integer seed = 32'hC0FFEE;
+ int errors = 0;
+ int valid_pulses = 0;
+ always @(posedge clk) if (key_valid) valid_pulses = valid_pulses + 1;
+
+ logic [KEY_BITS-1:0] k, exp_key;
+ logic [NUM_PAIRS-1:0] r, w, r_noisy;
+
+ // ---------------------------------------------------------------- helpers
+ // Build K, R and W. Then flip up to max_flips bits in each group of REP.
+ task automatic make_data(input int max_flips);
+  int nf, p;
+  logic [REP-1:0] fm;
+  for (int i = 0; i < KEY_BITS; i++) k[i] = $random(seed);
+  for (int i = 0; i < NUM_PAIRS; i++) r[i] = $random(seed);
+  for (int g = 0; g < KEY_BITS; g++) begin
+    for (int j = 0; j < REP; j++)
+      w[g*REP+j] = r[g*REP+j] ^ k[KEY_BITS-1-g];
+    nf = (max_flips >= 0) ? ($unsigned($random(seed)) % (max_flips + 1)) : 0;
+    fm = '0;
+    while ($countones(fm) < nf) begin
+      p = $unsigned($random(seed)) % REP;
+      fm[p] = 1'b1;
+    end
+    for (int j = 0; j < REP; j++)
+      r_noisy[g*REP+j] = r[g*REP+j] ^ fm[j];
+    // the group's majority is wrong only if MORE than REP/2 bits flipped
+    exp_key[KEY_BITS-1-g] = (nf > REP/2) ? ~k[KEY_BITS-1-g] : k[KEY_BITS-1-g];
+  end
+ endtask
+
+ // Build K, R, W, then flip EVERY bit independently with probability pe.
+ task automatic make_data_pe(input int pe_permille);
+  for (int i = 0; i < KEY_BITS; i++) k[i] = $random(seed);
+  for (int i = 0; i < NUM_PAIRS; i++) r[i] = $random(seed);
+  for (int g = 0; g < KEY_BITS; g++)
+   for (int j = 0; j < REP; j++)
+     w[g*REP+j] = r[g*REP+j] ^ k[KEY_BITS-1-g];
+
+  for (int i = 0; i < NUM_PAIRS; i++)
+   r_noisy[i] = r[i] ^ (($unsigned($random(seed)) % 1000) < pe_permille);
+ endtask
+
+ // Stream n pairs with random idle gaps (realistic back-pressure).
+ task automatic stream(input int n);
+  for (int i = 0; i < n; i++) begin
+   repeat ($unsigned($random(seed)) % 3) @(negedge clk);
+   @(negedge clk);
+   in_valid = 1; raw_bit = r_noisy[i]; helper_bit = w[i];
+   @(negedge clk);
+   in_valid = 0;
+  end
+ endtask
+
+ // Stream n pairs back to back, one per clock (fast, for Monte Carlo).
+ task automatic stream_fast(input int n);
+  for (int i = 0; i < n; i++) begin
+   @(negedge clk);
+   in_valid = 1; raw_bit = r_noisy[i]; helper_bit = w[i];
+  end
+  @(negedge clk);
+  in_valid = 0;
+ endtask
+
+ task automatic check_key(input string name);
+  repeat (3) @(negedge clk);
+  if (key !== exp_key) begin
+    $display(" FAIL %s", name);
+    $display("      got %h", key);
+    $display("      exp %h", exp_key);
+    errors = errors + 1;
+  end else
+    $display(" ok %s : key = %h", name, key);
+ endtask
+
+ // Binomial prediction, pre-computed for KEY_BITS = 64. Percent.
+ function automatic real theory_pct(input int idx);
+  real v;
+  v = -1.0;
+  case (REP)
+   5: case (idx)
+       0: v = 0.496; 1: v = 7.15; 2: v = 42.3;
+       3: v = 82.2;   4: v = 97.8;
+     endcase
+   9: case (idx)
+       0: v = 0.00241; 1: v = 0.212; 2: v = 5.54;
+       3: v = 30.3;   4: v = 71.8;
+     endcase
+   15: case (idx)
+       0: v = 0.00000093; 1: v = 0.00117; 2: v = 0.215;
+       3: v = 3.83;    4: v = 23.8;
+     endcase
+  endcase
+  return v;
+ endfunction
+
+ // ------------------------------------------------------------------- main
+
+ int pe_pm [5];
+ int fails;
+
+ initial begin
+  pe_pm[0] = 20; pe_pm[1] = 50; pe_pm[2] = 100; pe_pm[3] = 150; pe_pm[4] = 200;
+
+  $dumpfile("dump.vcd");
+  $dumpvars(0, tb_rep_decoder);
+
+  $display("=============================================================");
+  $display(" AuthentiRx rep_decoder : REP = %0d, KEY_BITS = %0d", REP, KEY_BITS);
+  $display("               NUM_PAIRS = %0d", NUM_PAIRS);
+  $display("=============================================================");
+  $display("PART A - directed tests");
+
+  #50 rst_n = 1;
+  #20;
+
+  // Test 1: correctable noise only
+  make_data(REP/2);
+  stream(NUM_PAIRS);
+  check_key("test1 <= REP/2 flips per group, key must be exact");
+  if (valid_pulses != 1) begin
+    $display(" FAIL key_valid pulses = %0d, expected 1", valid_pulses);
+    errors = errors + 1;
+  end
+
+  // Test 2: too much noise in some groups -> those bits must come out wrong
+  make_data(REP/2 + 1);
+  stream(NUM_PAIRS);
+  check_key("test2 > REP/2 flips, bits must flip exactly as predicted");
+  if (key === k) begin
+    $display(" FAIL test2: noise had no effect, test is not exercising errors");
+    errors = errors + 1;
+  end
+
+  // Test 3: abort halfway, then a clean full key
+  make_data(0);
+  stream(NUM_PAIRS/2 + 3);
+  @(negedge clk); clear = 1; @(negedge clk); clear = 0;
+  make_data(REP/2);
+  stream(NUM_PAIRS);
+  check_key("test3 clear mid-key, then a full key");
+
+  // Test 4: back-to-back keys
+  make_data(REP/2); stream(NUM_PAIRS); check_key("test4a back-to-back key 1");
+  make_data(REP/2); stream(NUM_PAIRS); check_key("test4b back-to-back key 2");
+
+  // Test 5: wipe must zero the key register
+  @(negedge clk); wipe = 1; @(negedge clk); wipe = 0; @(negedge clk);
+  if (key !== '0) begin
+    $display(" FAIL test5: key not zero after wipe: %h", key);
+    errors = errors + 1;
+  end else
+    $display(" ok test5 wipe zeroes the key register");
+
+  if (valid_pulses != 5) begin
+    $display(" FAIL total key_valid pulses = %0d, expected 5", valid_pulses);
+    errors = errors + 1;
+  end
+
+  // ---------------------------------------------------------------- Part B
+  // Stop waveform dumping here. Part A is what you want to look at in EPWave;
+  // dumping the Monte Carlo as well would produce a ~100 MB VCD that EPWave
+  // cannot open.
+  $dumpoff;
+
+  if (RUN_MC) begin
+    $display("");
+    $display("PART B - Monte Carlo key-recovery failure rate (REP = %0d)", REP);
+    $display(" bit error |       | key | measured | binomial");
+    $display(" rate pe | trials| failures| failure | prediction");
+    $display(" ----------+-------+---------+----------+------------");
+    for (int i = 0; i < 5; i++) begin
+     fails = 0;
+     for (int t = 0; t < TRIALS; t++) begin
+       make_data_pe(pe_pm[i]);
+       stream_fast(NUM_PAIRS);
+       repeat (2) @(negedge clk);
+       if (key !== k) fails = fails + 1;
+     end
+     $display(" %2d.%0d%% | %5d | %7d | %7.2f%% | %10.5f%%",
+            pe_pm[i]/10, pe_pm[i]%10, TRIALS, fails,
+            100.0*fails/TRIALS, theory_pct(i));
+    end
+    $display(" ----------+-------+---------+----------+------------");
+    $display(" (binomial column is blank/-1 unless REP is 5, 9 or 15)");
+  end
+
+  $display("");
+  if (errors == 0) $display("== PASS: all directed checks passed ==");
+  else         $display("== FAIL: %0d error(s) ==", errors);
+  $finish;
+ end
+
+ initial begin #500_000_000; $display("== FAIL: timeout =="); $finish; end
+
+endmodule
+
